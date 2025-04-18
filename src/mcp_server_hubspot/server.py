@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 import os
 from dotenv import load_dotenv
 from hubspot import HubSpot
-from hubspot.crm.contacts import SimplePublicObjectInputForCreate
+from hubspot.crm.contacts import SimplePublicObjectInputForCreate, SimplePublicObjectInput
 from hubspot.crm.contacts.exceptions import ApiException
 from mcp.server.models import InitializationOptions
 import mcp.types as types
@@ -14,6 +14,7 @@ import json
 from datetime import datetime, timedelta
 from dateutil.tz import tzlocal
 import argparse
+from mcp_server_hubspot import json_schema
 
 logger = logging.getLogger('mcp_hubspot_server')
 
@@ -343,6 +344,56 @@ class HubSpotClient:
             logger.error(f"Exception: {str(e)}")
             return json.dumps({"error": str(e)})
 
+    def search_contacts(self, query: Dict[str, Any]) -> str:
+        """Search contacts in HubSpot based on provided filters
+        
+        Args:
+            query: Dictionary containing search parameters and filters
+        """
+        try:
+            from hubspot.crm.contacts import PublicObjectSearchRequest
+            
+            # Build filter groups from query parameters
+            filter_groups = []
+            if "filters" in query:
+                filter_groups = [{
+                    "filters": [
+                        {
+                            "propertyName": filter["property"],
+                            "operator": filter.get("operator", "EQ"),
+                            "value": filter["value"]
+                        } for filter in query["filters"]
+                    ]
+                }]
+            
+            # Create search request
+            search_request = PublicObjectSearchRequest(
+                filter_groups=filter_groups,
+                sorts=[{
+                    "propertyName": "lastmodifieddate",
+                    "direction": "DESCENDING"
+                }],
+                properties=["firstname", "lastname", "email", "phone", "company", "hs_lastmodifieddate"],
+                limit=query.get("limit", 10)
+            )
+            
+            # Execute the search
+            search_response = self.client.crm.contacts.search_api.do_search(
+                public_object_search_request=search_request
+            )
+            
+            # Convert the response to a dictionary
+            contacts_dict = [contact.to_dict() for contact in search_response.results]
+            converted_contacts = convert_datetime_fields(contacts_dict)
+            return json.dumps(converted_contacts)
+            
+        except ApiException as e:
+            logger.error(f"API Exception: {str(e)}")
+            return json.dumps({"error": str(e)})
+        except Exception as e:
+            logger.error(f"Exception: {str(e)}")
+            return json.dumps({"error": str(e)})
+
 async def main(access_token: Optional[str] = None):
     """Run the HubSpot MCP server."""
     logger.info("Server starting")
@@ -368,16 +419,7 @@ async def main(access_token: Optional[str] = None):
             types.Tool(
                 name="hubspot_create_contact",
                 description="Create a new contact in HubSpot",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "firstname": {"type": "string", "description": "Contact's first name"},
-                        "lastname": {"type": "string", "description": "Contact's last name"},
-                        "email": {"type": "string", "description": "Contact's email address"},
-                        "properties": {"type": "object", "description": "Additional contact properties"}
-                    },
-                    "required": ["firstname", "lastname"]
-                },
+                inputSchema=json_schema.CREATE_CONTACT_SCHEMA,
             ),
             types.Tool(
                 name="hubspot_create_company",
@@ -432,6 +474,16 @@ async def main(access_token: Optional[str] = None):
                         "limit": {"type": "integer", "description": "Maximum number of contacts to return (default: 10)"}
                     },
                 },
+            ),
+            types.Tool(
+                name="hubspot_update_contact",
+                description="Update an existing contact in HubSpot",
+                inputSchema=json_schema.UPDATE_CONTACT_SCHEMA,
+            ),
+            types.Tool(
+                name="hubspot_search_contacts",
+                description="Search for contacts in HubSpot using filters",
+                inputSchema=json_schema.SEARCH_CONTACTS_SCHEMA,
             ),
         ]
 
@@ -612,6 +664,49 @@ async def main(access_token: Optional[str] = None):
                 
                 # Get recent contacts
                 results = hubspot.get_recent_contacts(limit=limit)
+                return [types.TextContent(type="text", text=results)]
+
+            elif name == "hubspot_update_contact":
+                if not arguments:
+                    raise ValueError("Missing arguments for update_contact")
+                
+                contact_id = arguments["contact_id"]
+                
+                # Prepare properties for update
+                properties = {}
+                
+                # Add basic properties if provided
+                if "firstname" in arguments:
+                    properties["firstname"] = arguments["firstname"]
+                if "lastname" in arguments:
+                    properties["lastname"] = arguments["lastname"]
+                if "email" in arguments:
+                    properties["email"] = arguments["email"]
+                
+                # Add any additional properties
+                if "properties" in arguments:
+                    properties.update(arguments["properties"])
+                
+                try:
+                    # Create SimplePublicObjectInput for the update
+                    simple_public_object_input = SimplePublicObjectInput(
+                        properties=properties
+                    )
+                    
+                    # Update the contact
+                    api_response = hubspot.client.crm.contacts.basic_api.update(
+                        contact_id=contact_id,
+                        simple_public_object_input=simple_public_object_input
+                    )
+                    return [types.TextContent(type="text", text=str(api_response.to_dict()))]
+                    
+                except ApiException as e:
+                    return [types.TextContent(type="text", text=f"HubSpot API error: {str(e)}")]
+
+            elif name == "hubspot_search_contacts":
+                if not arguments:
+                    raise ValueError("Missing arguments for search_contacts")
+                results = hubspot.search_contacts(arguments)
                 return [types.TextContent(type="text", text=results)]
 
             else:
